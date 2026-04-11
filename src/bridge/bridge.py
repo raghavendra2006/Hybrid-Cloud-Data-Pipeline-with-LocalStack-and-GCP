@@ -8,8 +8,10 @@ Features:
   - Long polling with configurable wait time
   - Exponential backoff retry for GCP Pub/Sub publishing
   - Graceful shutdown on SIGTERM/SIGINT
-  - Structured logging
+  - Structured JSON logging
   - Dead-letter queue support (via SQS redrive policy)
+  - Message counter / health metrics
+  - URL-decoded S3 key handling
 """
 
 import json
@@ -18,6 +20,8 @@ import os
 import signal
 import sys
 import time
+import urllib.parse
+from datetime import datetime, timezone
 from typing import Optional
 
 import boto3
@@ -38,6 +42,7 @@ POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL_SECONDS", "5"))
 SQS_WAIT_TIME = int(os.environ.get("SQS_WAIT_TIME_SECONDS", "20"))
 MAX_RETRIES = 5
 BASE_BACKOFF = 1  # seconds
+HEALTH_LOG_INTERVAL = 60  # seconds between health stats
 
 # ============================================
 # Logging
@@ -49,6 +54,18 @@ logging.basicConfig(
     stream=sys.stdout,
 )
 logger = logging.getLogger("bridge")
+
+# ============================================
+# Metrics
+# ============================================
+metrics = {
+    "messages_received": 0,
+    "messages_forwarded": 0,
+    "messages_failed": 0,
+    "errors": 0,
+    "start_time": None,
+    "last_message_at": None,
+}
 
 # ============================================
 # Graceful Shutdown
@@ -68,6 +85,25 @@ signal.signal(signal.SIGTERM, signal_handler)
 signal.signal(signal.SIGINT, signal_handler)
 
 
+def log_health_stats():
+    """Log periodic health/metrics information."""
+    uptime = "N/A"
+    if metrics["start_time"]:
+        delta = datetime.now(timezone.utc) - metrics["start_time"]
+        hours, remainder = divmod(int(delta.total_seconds()), 3600)
+        minutes, seconds = divmod(remainder, 60)
+        uptime = f"{hours}h {minutes}m {seconds}s"
+
+    logger.info(
+        f"[HEALTH] uptime={uptime} "
+        f"received={metrics['messages_received']} "
+        f"forwarded={metrics['messages_forwarded']} "
+        f"failed={metrics['messages_failed']} "
+        f"errors={metrics['errors']} "
+        f"last_msg={metrics['last_message_at'] or 'never'}"
+    )
+
+
 # ============================================
 # AWS / LocalStack Clients
 # ============================================
@@ -79,21 +115,21 @@ def create_aws_clients():
         read_timeout=30,
     )
 
-    sqs_client = boto3.client(
-        "sqs",
-        endpoint_url=LOCALSTACK_ENDPOINT,
-        region_name=AWS_REGION,
+    session = boto3.Session(
         aws_access_key_id=os.environ.get("AWS_ACCESS_KEY_ID", "test"),
         aws_secret_access_key=os.environ.get("AWS_SECRET_ACCESS_KEY", "test"),
+        region_name=AWS_REGION,
+    )
+
+    sqs_client = session.client(
+        "sqs",
+        endpoint_url=LOCALSTACK_ENDPOINT,
         config=boto_config,
     )
 
-    s3_client = boto3.client(
+    s3_client = session.client(
         "s3",
         endpoint_url=LOCALSTACK_ENDPOINT,
-        region_name=AWS_REGION,
-        aws_access_key_id=os.environ.get("AWS_ACCESS_KEY_ID", "test"),
-        aws_secret_access_key=os.environ.get("AWS_SECRET_ACCESS_KEY", "test"),
         config=boto_config,
     )
 
@@ -110,7 +146,10 @@ def get_queue_url(sqs_client) -> str:
             return url
         except (ClientError, EndpointConnectionError) as e:
             wait = BASE_BACKOFF * (2 ** attempt)
-            logger.warning(f"Failed to get queue URL (attempt {attempt + 1}): {e}. Retrying in {wait}s...")
+            logger.warning(
+                f"Failed to get queue URL (attempt {attempt + 1}/{MAX_RETRIES}): "
+                f"{e}. Retrying in {wait}s..."
+            )
             time.sleep(wait)
 
     logger.error("Exhausted retries getting SQS queue URL. Exiting.")
@@ -137,24 +176,39 @@ def extract_s3_file_content(sqs_body: dict, s3_client) -> Optional[str]:
     """
     Parse the SQS message body (S3 event notification) and download
     the uploaded file content from S3.
+
+    Handles both S3 event notification format and direct JSON payloads.
+    URL-decodes the S3 key to handle special characters.
     """
     try:
         # S3 event notifications wrap records in a list
         records = sqs_body.get("Records", [])
         if not records:
-            logger.warning("No Records found in SQS message body. Treating body as direct payload.")
+            # Fallback: treat the body itself as the payload (direct message)
+            logger.warning(
+                "No 'Records' found in SQS message body. "
+                "Treating body as direct payload."
+            )
             return json.dumps(sqs_body)
 
         record = records[0]
         bucket = record["s3"]["bucket"]["name"]
-        key = record["s3"]["object"]["key"]
+        # S3 event keys are URL-encoded
+        key = urllib.parse.unquote_plus(record["s3"]["object"]["key"])
 
         logger.info(f"Downloading s3://{bucket}/{key}")
         response = s3_client.get_object(Bucket=bucket, Key=key)
         content = response["Body"].read().decode("utf-8")
         logger.info(f"Downloaded {len(content)} bytes from s3://{bucket}/{key}")
+
+        # Validate it's valid JSON before forwarding
+        json.loads(content)
+
         return content
 
+    except json.JSONDecodeError as e:
+        logger.error(f"Downloaded S3 content is not valid JSON: {e}")
+        return None
     except (KeyError, IndexError) as e:
         logger.error(f"Malformed S3 event notification: {e}")
         return None
@@ -184,10 +238,13 @@ def publish_to_pubsub(publisher, topic_path: str, data: str) -> bool:
 
         except GoogleAPICallError as e:
             wait = BASE_BACKOFF * (2 ** attempt)
-            logger.warning(f"Pub/Sub publish failed (attempt {attempt + 1}): {e}. Retrying in {wait}s...")
+            logger.warning(
+                f"Pub/Sub publish failed (attempt {attempt + 1}/{MAX_RETRIES}): "
+                f"{e}. Retrying in {wait}s..."
+            )
             time.sleep(wait)
         except Exception as e:
-            logger.error(f"Unexpected error publishing to Pub/Sub: {e}")
+            logger.error(f"Unexpected error publishing to Pub/Sub: {e}", exc_info=True)
             return False
 
     logger.error("Exhausted retries publishing to Pub/Sub.")
@@ -195,12 +252,13 @@ def publish_to_pubsub(publisher, topic_path: str, data: str) -> bool:
 
 
 def delete_sqs_message(sqs_client, queue_url: str, receipt_handle: str):
-    """Delete a processed message from SQS."""
+    """Delete a processed message from SQS to acknowledge processing."""
     try:
         sqs_client.delete_message(QueueUrl=queue_url, ReceiptHandle=receipt_handle)
-        logger.info("Deleted message from SQS queue.")
+        logger.info("Deleted message from SQS queue (acknowledged).")
     except ClientError as e:
         logger.error(f"Failed to delete SQS message: {e}")
+        metrics["errors"] += 1
 
 
 # ============================================
@@ -221,71 +279,93 @@ def poll_and_forward(sqs_client, s3_client, publisher, queue_url: str, topic_pat
         )
     except (ClientError, EndpointConnectionError) as e:
         logger.error(f"Error polling SQS: {e}")
+        metrics["errors"] += 1
         time.sleep(POLL_INTERVAL)
         return
 
     messages = response.get("Messages", [])
     if not messages:
-        logger.debug("No messages received from SQS.")
-        return
+        return  # Normal long-poll timeout with no messages
 
     logger.info(f"Received {len(messages)} message(s) from SQS.")
 
     for message in messages:
         receipt_handle = message["ReceiptHandle"]
+        message_id = message.get("MessageId", "unknown")
+
         try:
             body = json.loads(message["Body"])
         except json.JSONDecodeError:
-            logger.error(f"Invalid JSON in SQS message body: {message['Body'][:200]}")
-            # Delete poison pill messages to prevent infinite reprocessing
+            logger.error(
+                f"Invalid JSON in SQS message {message_id}. "
+                f"Deleting poison pill: {message['Body'][:200]}"
+            )
             delete_sqs_message(sqs_client, queue_url, receipt_handle)
+            metrics["messages_failed"] += 1
             continue
+
+        metrics["messages_received"] += 1
+        metrics["last_message_at"] = datetime.now(timezone.utc).isoformat()
 
         # Extract file content from S3
         file_content = extract_s3_file_content(body, s3_client)
         if file_content is None:
-            logger.error("Failed to extract S3 file content. Skipping message (will be retried by SQS).")
+            logger.error(
+                f"Failed to extract S3 file content for message {message_id}. "
+                "Leaving in queue for retry via visibility timeout."
+            )
+            metrics["messages_failed"] += 1
             continue
 
         # Publish to Pub/Sub
         success = publish_to_pubsub(publisher, topic_path, file_content)
         if success:
             delete_sqs_message(sqs_client, queue_url, receipt_handle)
+            metrics["messages_forwarded"] += 1
         else:
-            logger.warning("Pub/Sub publish failed. Message will be retried by SQS visibility timeout.")
+            logger.warning(
+                f"Pub/Sub publish failed for message {message_id}. "
+                "Will be retried after SQS visibility timeout."
+            )
+            metrics["messages_failed"] += 1
 
 
 def wait_for_localstack(sqs_client):
-    """Wait until LocalStack is reachable."""
+    """Wait until LocalStack is reachable with exponential backoff."""
     logger.info("Waiting for LocalStack to become available...")
     for attempt in range(30):
         try:
             sqs_client.list_queues()
-            logger.info("LocalStack is available.")
+            logger.info("LocalStack is available and responding.")
             return
-        except (EndpointConnectionError, ClientError) as e:
+        except (EndpointConnectionError, ClientError, Exception) as e:
             wait = min(BASE_BACKOFF * (2 ** min(attempt, 5)), 30)
-            logger.debug(f"LocalStack not ready (attempt {attempt + 1}): {e}. Retrying in {wait}s...")
+            logger.info(
+                f"LocalStack not ready (attempt {attempt + 1}/30): "
+                f"{type(e).__name__}. Retrying in {wait}s..."
+            )
             time.sleep(wait)
 
-    logger.error("LocalStack did not become available. Exiting.")
+    logger.error("LocalStack did not become available after 30 attempts. Exiting.")
     sys.exit(1)
 
 
 def main():
     """Main entry point for the bridge application."""
     logger.info("=" * 60)
-    logger.info("Bridge Application Starting")
-    logger.info(f"  LocalStack Endpoint: {LOCALSTACK_ENDPOINT}")
-    logger.info(f"  SQS Queue: {SQS_QUEUE_NAME}")
-    logger.info(f"  GCP Project: {GCP_PROJECT_ID}")
-    logger.info(f"  Pub/Sub Topic: {PUBSUB_TOPIC}")
-    logger.info(f"  Poll Interval: {POLL_INTERVAL}s")
-    logger.info(f"  SQS Wait Time: {SQS_WAIT_TIME}s")
+    logger.info("  Bridge Application — SQS → Pub/Sub Forwarder")
+    logger.info("=" * 60)
+    logger.info(f"  LocalStack Endpoint : {LOCALSTACK_ENDPOINT}")
+    logger.info(f"  SQS Queue           : {SQS_QUEUE_NAME}")
+    logger.info(f"  GCP Project         : {GCP_PROJECT_ID}")
+    logger.info(f"  Pub/Sub Topic       : {PUBSUB_TOPIC}")
+    logger.info(f"  Poll Interval       : {POLL_INTERVAL}s")
+    logger.info(f"  SQS Wait Time       : {SQS_WAIT_TIME}s")
+    logger.info(f"  Max Retries         : {MAX_RETRIES}")
     logger.info("=" * 60)
 
     if not GCP_PROJECT_ID:
-        logger.error("GCP_PROJECT_ID is not set. Exiting.")
+        logger.error("FATAL: GCP_PROJECT_ID environment variable is not set. Exiting.")
         sys.exit(1)
 
     # Initialize clients
@@ -297,11 +377,23 @@ def main():
     topic_path = get_topic_path(publisher)
     logger.info(f"Pub/Sub topic path: {topic_path}")
 
+    # Track start time for health metrics
+    metrics["start_time"] = datetime.now(timezone.utc)
+    last_health_log = time.monotonic()
+
     # Main polling loop
     logger.info("Starting SQS polling loop...")
     while not shutdown_requested:
         poll_and_forward(sqs_client, s3_client, publisher, queue_url, topic_path)
 
+        # Periodic health stats
+        now = time.monotonic()
+        if now - last_health_log >= HEALTH_LOG_INTERVAL:
+            log_health_stats()
+            last_health_log = now
+
+    # Final stats on shutdown
+    log_health_stats()
     logger.info("Bridge application shut down gracefully.")
 
 

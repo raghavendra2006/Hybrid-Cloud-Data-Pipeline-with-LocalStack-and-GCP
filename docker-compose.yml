@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   # ============================================
   # LocalStack - Simulated AWS Environment
@@ -20,10 +18,11 @@ services:
       - "/var/run/docker.sock:/var/run/docker.sock"
       - "./localstack_init:/etc/localstack/init/ready.d"
     healthcheck:
-      test: ["CMD", "awslocal", "health"]
+      test: ["CMD-SHELL", "curl -sf http://localhost:4566/_localstack/health | grep -q '\"services\"' || exit 1"]
       interval: 10s
       timeout: 5s
-      retries: 5
+      retries: 10
+      start_period: 30s
     networks:
       - pipeline-network
 
@@ -52,6 +51,11 @@ services:
     volumes:
       - "${PATH_TO_GCP_KEYFILE:-./gcp-service-account-key.json}:/app/gcp-key.json:ro"
     restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     networks:
       - pipeline-network
 
