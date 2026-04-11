@@ -1,0 +1,5 @@
+{
+  "gcpProjectId": "your-gcp-project-id",
+  "gcpRegion": "us-central1",
+  "testEventFile": "test-event.json"
+}

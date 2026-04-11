@@ -1,0 +1,60 @@
+version: '3.8'
+
+services:
+  # ============================================
+  # LocalStack - Simulated AWS Environment
+  # ============================================
+  localstack:
+    container_name: "localstack_main"
+    image: localstack/localstack:latest
+    ports:
+      - "127.0.0.1:4566:4566"            # LocalStack Gateway
+      - "127.0.0.1:4510-4559:4510-4559"  # External services port range
+    environment:
+      - DEBUG=1
+      - SERVICES=s3,sqs,dynamodb,iam
+      - PERSISTENCE=1
+      - DATA_DIR=/tmp/localstack/data
+    volumes:
+      - "./localstack_data:/tmp/localstack"
+      - "/var/run/docker.sock:/var/run/docker.sock"
+      - "./localstack_init:/etc/localstack/init/ready.d"
+    healthcheck:
+      test: ["CMD", "awslocal", "health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - pipeline-network
+
+  # ============================================
+  # Bridge Application - SQS → Pub/Sub Forwarder
+  # ============================================
+  bridge:
+    container_name: "bridge_app"
+    build:
+      context: ./src/bridge
+      dockerfile: Dockerfile
+    depends_on:
+      localstack:
+        condition: service_healthy
+    environment:
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:-test}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY:-test}
+      - AWS_DEFAULT_REGION=${AWS_DEFAULT_REGION:-us-east-1}
+      - LOCALSTACK_ENDPOINT=http://localstack:4566
+      - SQS_QUEUE_NAME=${SQS_QUEUE_NAME:-data-processing-queue}
+      - PUBSUB_TOPIC=${PUBSUB_TOPIC:-localstack-events}
+      - GCP_PROJECT_ID=${GCP_PROJECT_ID}
+      - GOOGLE_APPLICATION_CREDENTIALS=/app/gcp-key.json
+      - POLL_INTERVAL_SECONDS=${POLL_INTERVAL_SECONDS:-5}
+      - SQS_WAIT_TIME_SECONDS=${SQS_WAIT_TIME_SECONDS:-20}
+    volumes:
+      - "${PATH_TO_GCP_KEYFILE:-./gcp-service-account-key.json}:/app/gcp-key.json:ro"
+    restart: unless-stopped
+    networks:
+      - pipeline-network
+
+networks:
+  pipeline-network:
+    driver: bridge
