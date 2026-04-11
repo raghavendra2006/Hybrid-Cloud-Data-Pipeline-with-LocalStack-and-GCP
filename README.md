@@ -1,6 +1,6 @@
 # 🌐 Hybrid Cloud Data Pipeline
 
-> **A production-ready, event-driven data pipeline bridging LocalStack (simulated AWS) and Google Cloud Platform — provisioned entirely with Terraform Infrastructure as Code.**
+> **A production-grade, event-driven data pipeline bridging LocalStack (simulated AWS) and Google Cloud Platform — provisioned entirely with Terraform Infrastructure as Code.**
 
 [![Architecture](https://img.shields.io/badge/Architecture-Hybrid_Cloud-blue)]()
 [![IaC](https://img.shields.io/badge/IaC-Terraform-purple)]()
@@ -25,7 +25,8 @@
 - [Testing the Pipeline](#-testing-the-pipeline)
 - [Troubleshooting](#-troubleshooting)
 - [Security Considerations](#-security-considerations)
-- [License](#-license)
+- [Design Decisions](#-design-decisions)
+- [Cleanup](#-cleanup)
 
 ---
 
@@ -35,24 +36,24 @@ This project demonstrates a **hybrid multi-cloud architecture** — a pattern in
 
 ### What It Does
 
-1. **Data Ingestion**: A JSON file is uploaded to an S3 bucket (simulated via LocalStack)
-2. **Event Notification**: S3 triggers an SQS message notifying the system of the new file
-3. **Cross-Cloud Bridge**: A Python bridge application polls SQS and forwards the data to GCP Pub/Sub
-4. **Processing**: A GCP Cloud Function processes the data, adding timestamps
-5. **Dual Storage**: Processed records are stored in both GCP Cloud SQL (PostgreSQL) and LocalStack DynamoDB
+1. **Data Ingestion** — A JSON file is uploaded to an S3 bucket (simulated via LocalStack)
+2. **Event Notification** — S3 triggers an SQS message notifying the system of the new file
+3. **Cross-Cloud Bridge** — A Python bridge application polls SQS and forwards the data to GCP Pub/Sub
+4. **Processing** — A GCP Cloud Function processes the data, adding timestamps
+5. **Dual Storage** — Processed records are stored in both GCP Cloud SQL (PostgreSQL) and LocalStack DynamoDB
 
 ### Key Technologies
 
 | Component | Technology | Purpose |
 |-----------|-----------|---------|
 | Local AWS Simulation | LocalStack | S3, SQS, DynamoDB without AWS costs |
-| Infrastructure as Code | Terraform | Multi-cloud provisioning from a single codebase |
-| Message Bridge | Python + Docker | Cross-cloud message forwarding |
+| Infrastructure as Code | Terraform (multi-provider) | Multi-cloud provisioning from a single codebase |
+| Message Bridge | Python 3.11 + Docker | Cross-cloud message forwarding with retries |
 | Event Processing | GCP Cloud Functions | Serverless data transformation |
-| Message Bus (AWS) | SQS + DLQ | Reliable message queuing with dead-letter support |
-| Message Bus (GCP) | Pub/Sub | Scalable event ingestion |
-| Relational Storage | Cloud SQL (PostgreSQL) | ACID-compliant record storage |
-| NoSQL Storage | DynamoDB (LocalStack) | High-performance key-value storage |
+| Message Bus (AWS) | SQS + Dead-Letter Queue | Reliable message queuing with poison-pill capture |
+| Message Bus (GCP) | Pub/Sub + Dead-Letter Topic | Scalable event ingestion with retry policy |
+| Relational Storage | Cloud SQL (PostgreSQL 14) | ACID-compliant record storage with upsert |
+| NoSQL Storage | DynamoDB (LocalStack) | High-performance key-value write-back |
 
 ---
 
@@ -87,17 +88,19 @@ This project demonstrates a **hybrid multi-cloud architecture** — a pattern in
 │  ┌──────────────────┐                  │                   │
 │  │  Pub/Sub Topic   │ ◀───────────────┘                   │
 │  │  localstack-     │                                      │
-│  │  events          │                                      │
+│  │  events (+DLQ)   │                                      │
 │  └────────┬─────────┘                                      │
 │           │ Trigger                                        │
 │           ▼                                                │
-│  ┌──────────────────┐    Write     ┌──────────────────┐   │
-│  │  Cloud Function  │ ──────────▶  │  Cloud SQL       │   │
-│  │  (Processor)     │             │  (PostgreSQL)    │   │
-│  └────────┬─────────┘             │  pipelinedb      │   │
-│           │                        └──────────────────┘   │
-│           │ Write-back to LocalStack DynamoDB              │
-└───────────│───────────────────────────────────────────────┘
+│  ┌──────────────────┐    Upsert   ┌──────────────────┐    │
+│  │  Cloud Function  │ ──────────▶ │  Cloud SQL       │    │
+│  │  (Processor)     │             │  PostgreSQL 14   │    │
+│  │  - Validates     │             │  pipelinedb      │    │
+│  │  - Timestamps    │             │  └─ records      │    │
+│  └────────┬─────────┘             └──────────────────┘    │
+│           │                                                │
+│           │ Write-back to LocalStack DynamoDB               │
+└───────────│────────────────────────────────────────────────┘
             │
             └──────────────▶ (crosses cloud boundary)
 ```
@@ -119,16 +122,18 @@ sequenceDiagram
 
     User->>S3: Upload test-event.json
     S3->>SQS: S3 Event Notification
-    Bridge->>SQS: Long Poll (20s)
-    SQS-->>Bridge: Message (S3 event details)
+    Bridge->>SQS: Long Poll (20s wait)
+    SQS-->>Bridge: Message with S3 event details
     Bridge->>S3: Download file content
     S3-->>Bridge: JSON data
+    Bridge->>Bridge: Validate JSON
     Bridge->>PubSub: Publish message
     Bridge->>SQS: Delete message (ACK)
     PubSub->>CF: Trigger function
-    CF->>CF: Parse + Add timestamp
-    CF->>SQL: INSERT/UPSERT record
-    CF->>DDB: put_item (write-back)
+    CF->>CF: Validate fields & types
+    CF->>CF: Add processedAt timestamp
+    CF->>SQL: UPSERT record (ON CONFLICT)
+    CF->>DDB: put_item (idempotent write-back)
 ```
 
 ---
@@ -138,16 +143,17 @@ sequenceDiagram
 | Tool | Version | Purpose |
 |------|---------|---------|
 | [Docker](https://docs.docker.com/get-docker/) | 20.10+ | Container runtime |
-| [Docker Compose](https://docs.docker.com/compose/) | 2.0+ | Service orchestration |
-| [Terraform](https://www.terraform.io/downloads) | 1.3+ | Infrastructure as Code |
-| [AWS CLI](https://aws.amazon.com/cli/) | 2.x | LocalStack interaction |
+| [Docker Compose](https://docs.docker.com/compose/) | V2 (2.0+) | Service orchestration |
+| [Terraform](https://www.terraform.io/downloads) | >= 1.3.0 | Infrastructure as Code |
+| [AWS CLI v2](https://aws.amazon.com/cli/) | 2.x | LocalStack interaction via `awslocal` |
 | [gcloud CLI](https://cloud.google.com/sdk/docs/install) | Latest | GCP interaction |
 | [Python](https://www.python.org/) | 3.11+ | Local development (optional) |
 
 ### GCP Setup
 
-1. Create a GCP project and enable billing
-2. Enable required APIs:
+1. **Create a GCP project** and enable billing
+
+2. **Enable required APIs**:
    ```bash
    gcloud services enable \
        pubsub.googleapis.com \
@@ -156,24 +162,27 @@ sequenceDiagram
        cloudbuild.googleapis.com \
        storage.googleapis.com
    ```
-3. Create a service account with the required roles:
+
+3. **Create a service account** with the required roles:
    ```bash
    gcloud iam service-accounts create pipeline-sa \
        --display-name="Pipeline Service Account"
 
-   # Grant required roles
+   # Grant required roles (least privilege)
    for role in \
        roles/cloudfunctions.admin \
        roles/pubsub.editor \
        roles/cloudsql.client \
        roles/cloudsql.admin \
-       roles/storage.admin; do
+       roles/storage.admin \
+       roles/iam.serviceAccountUser; do
        gcloud projects add-iam-policy-binding YOUR_PROJECT_ID \
            --member="serviceAccount:pipeline-sa@YOUR_PROJECT_ID.iam.gserviceaccount.com" \
            --role="$role"
    done
    ```
-4. Download the JSON key file:
+
+4. **Download the JSON key file**:
    ```bash
    gcloud iam service-accounts keys create gcp-service-account-key.json \
        --iam-account=pipeline-sa@YOUR_PROJECT_ID.iam.gserviceaccount.com
@@ -182,16 +191,13 @@ sequenceDiagram
 ### AWS CLI Configuration (for LocalStack)
 
 ```bash
-# Configure a LocalStack profile
-aws configure --profile localstack <<EOF
-test
-test
-us-east-1
-json
-EOF
+# Option 1: Install awslocal wrapper (recommended)
+pip install awscli-local
 
-# Alias for convenience
-alias awslocal='aws --endpoint-url=http://localhost:4566 --profile localstack'
+# Option 2: Use an alias
+alias awslocal='aws --endpoint-url=http://localhost:4566 --region us-east-1'
+export AWS_ACCESS_KEY_ID=test
+export AWS_SECRET_ACCESS_KEY=test
 ```
 
 ---
@@ -207,25 +213,26 @@ cd Hybrid-Cloud-Data-Pipeline-with-LocalStack-and-GCP
 # Create environment file from template
 cp .env.example .env
 
-# Edit .env with your actual values
-# - Set GCP_PROJECT_ID
-# - Set PATH_TO_GCP_KEYFILE
-# - Set CLOUD_SQL_PASSWORD
+# Edit .env with your actual values:
+#   - GCP_PROJECT_ID (your GCP project ID)
+#   - PATH_TO_GCP_KEYFILE (path to downloaded service account key)
+#   - CLOUD_SQL_PASSWORD (a strong password)
 ```
 
 ### 2. Start LocalStack & Bridge
 
 ```bash
-# Start all services (LocalStack + Bridge)
+# Build and start all services
 docker-compose up --build -d
 
-# Wait for LocalStack to become healthy
-docker-compose ps  # Check STATUS column shows "healthy"
+# Wait for LocalStack to become healthy (~30-60 seconds)
+docker-compose ps
+# Look for: localstack_main  ...  Up (healthy)
 
-# Verify LocalStack resources were created
-awslocal s3 ls
-awslocal sqs list-queues
-awslocal dynamodb list-tables
+# Verify LocalStack resources were created by the init script
+awslocal s3 ls                    # Should show: hybrid-cloud-bucket
+awslocal sqs list-queues          # Should show: data-processing-queue
+awslocal dynamodb list-tables     # Should show: processed-records
 ```
 
 ### 3. Deploy GCP Infrastructure with Terraform
@@ -237,29 +244,34 @@ cd terraform
 cp terraform.tfvars.example terraform.tfvars
 # Edit terraform.tfvars with your GCP project details
 
-# Initialize and apply
+# Initialize, validate, and apply
 terraform init
 terraform validate
-terraform plan
-terraform apply
+terraform plan -out=tfplan
+terraform apply tfplan
+
+# Note: Cloud SQL provisioning takes 5-10 minutes
 ```
 
 ### 4. Test the Pipeline
 
 ```bash
-# Upload test event to trigger the pipeline
-awslocal s3 cp ../test-event.json s3://hybrid-cloud-bucket/
+# Upload test event to trigger the full pipeline
+awslocal s3 cp test-event.json s3://hybrid-cloud-bucket/
 
-# Check SQS for the notification (should appear within seconds)
-awslocal sqs receive-message \
-    --queue-url http://localhost:4566/000000000000/data-processing-queue
+# Watch bridge logs (should show message received and forwarded)
+docker logs bridge_app -f
 
-# Wait ~30 seconds for the bridge to process and forward to GCP
+# Wait ~60 seconds for end-to-end processing, then verify:
 
-# Verify DynamoDB write-back
+# Check DynamoDB write-back
 awslocal dynamodb get-item \
     --table-name processed-records \
     --key '{"recordId":{"S":"xyz-789"}}'
+
+# Check Cloud SQL
+gcloud sql connect hybrid-pipeline-db --user=pipeline_user --database=pipelinedb
+# SQL> SELECT * FROM records WHERE id = 'xyz-789';
 ```
 
 ---
@@ -269,35 +281,36 @@ awslocal dynamodb get-item \
 ```
 Hybrid-Cloud-Data-Pipeline-with-LocalStack-and-GCP/
 │
-├── docker-compose.yml          # Orchestrates LocalStack + Bridge
-├── .env.example                # Environment variable template
-├── .gitignore                  # Git ignore rules
-├── submission.json             # Automated evaluation config
-├── test-event.json             # Sample pipeline input data
-├── README.md                   # This file
+├── docker-compose.yml            # Orchestrates LocalStack + Bridge
+├── .env.example                  # Environment variable template
+├── .gitignore                    # Git ignore rules
+├── submission.json               # Automated evaluation config
+├── test-event.json               # Sample pipeline input data
+├── README.md                     # This file
 │
-├── terraform/                  # Infrastructure as Code
-│   ├── providers.tf            # AWS (LocalStack) + GCP providers
-│   ├── variables.tf            # Variable definitions
-│   ├── localstack.tf           # S3, SQS, DynamoDB resources
-│   ├── gcp.tf                  # Pub/Sub, Cloud SQL, Cloud Function
-│   ├── outputs.tf              # Output values
-│   └── terraform.tfvars.example # Variable values template
+├── terraform/                    # Infrastructure as Code
+│   ├── providers.tf              # AWS (→ LocalStack) + GCP + Archive providers
+│   ├── variables.tf              # Variable definitions with defaults
+│   ├── localstack.tf             # S3, SQS (+DLQ), DynamoDB, S3→SQS notification
+│   ├── gcp.tf                    # Pub/Sub (+DLQ), Cloud SQL, Cloud Function, APIs
+│   ├── outputs.tf                # Output values for resource references
+│   └── terraform.tfvars.example  # Variable values template
 │
 ├── src/
-│   ├── bridge/                 # SQS → Pub/Sub bridge application
-│   │   ├── bridge.py           # Main application code
-│   │   ├── requirements.txt    # Python dependencies
-│   │   └── Dockerfile          # Container image definition
+│   ├── bridge/                   # SQS → Pub/Sub bridge application
+│   │   ├── bridge.py             # Main polling loop with health metrics
+│   │   ├── requirements.txt      # Python dependencies
+│   │   ├── Dockerfile            # Production container image
+│   │   └── .dockerignore         # Build context exclusions
 │   │
-│   └── processor_function/     # GCP Cloud Function
-│       ├── main.py             # Function entry point
-│       └── requirements.txt    # Python dependencies
+│   └── processor_function/       # GCP Cloud Function
+│       ├── main.py               # Pub/Sub handler with connection pooling
+│       └── requirements.txt      # Python dependencies
 │
-├── localstack_init/            # LocalStack initialization
-│   └── setup-s3-notifications.sh  # Auto-creates resources on startup
+├── localstack_init/              # LocalStack initialization
+│   └── setup-s3-notifications.sh # Auto-creates resources on container start
 │
-└── localstack_data/            # Persistent LocalStack data (gitignored)
+└── localstack_data/              # Persistent LocalStack data (gitignored)
 ```
 
 ---
@@ -308,56 +321,72 @@ Hybrid-Cloud-Data-Pipeline-with-LocalStack-and-GCP/
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `GCP_PROJECT_ID` | ✅ | — | Your GCP project ID |
-| `GCP_REGION` | ❌ | `us-central1` | GCP region for resources |
+| `GCP_PROJECT_ID` | ✅ | — | Google Cloud project ID |
+| `GCP_REGION` | ❌ | `us-central1` | GCP region for resource deployment |
 | `PATH_TO_GCP_KEYFILE` | ✅ | — | Path to service account JSON key |
-| `AWS_ACCESS_KEY_ID` | ❌ | `test` | AWS access key (LocalStack) |
-| `AWS_SECRET_ACCESS_KEY` | ❌ | `test` | AWS secret key (LocalStack) |
-| `AWS_DEFAULT_REGION` | ❌ | `us-east-1` | AWS region |
-| `LOCALSTACK_ENDPOINT` | ❌ | `http://localhost:4566` | LocalStack gateway URL |
-| `SQS_QUEUE_NAME` | ❌ | `data-processing-queue` | SQS queue name |
+| `AWS_ACCESS_KEY_ID` | ❌ | `test` | AWS access key (LocalStack static) |
+| `AWS_SECRET_ACCESS_KEY` | ❌ | `test` | AWS secret key (LocalStack static) |
+| `AWS_DEFAULT_REGION` | ❌ | `us-east-1` | AWS region for LocalStack |
+| `SQS_QUEUE_NAME` | ❌ | `data-processing-queue` | SQS queue name for S3 events |
 | `PUBSUB_TOPIC` | ❌ | `localstack-events` | GCP Pub/Sub topic name |
-| `POLL_INTERVAL_SECONDS` | ❌ | `5` | Bridge poll interval |
-| `SQS_WAIT_TIME_SECONDS` | ❌ | `20` | SQS long polling wait time |
-| `CLOUD_SQL_PASSWORD` | ✅ | — | Cloud SQL user password |
+| `POLL_INTERVAL_SECONDS` | ❌ | `5` | Delay between poll cycles (seconds) |
+| `SQS_WAIT_TIME_SECONDS` | ❌ | `20` | SQS long poll wait (max: 20) |
+| `CLOUD_SQL_PASSWORD` | ✅ | — | Password for Cloud SQL `pipeline_user` |
+| `CLOUD_SQL_DATABASE` | ❌ | `pipelinedb` | Cloud SQL database name |
+| `DYNAMODB_TABLE_NAME` | ❌ | `processed-records` | DynamoDB table for write-back |
+
+> **Note**: `LOCALSTACK_ENDPOINT` is set automatically to `http://localstack:4566` inside Docker Compose. Use `http://localhost:4566` only when interacting from the host machine.
 
 ### Input Data Contract
 
-The pipeline expects JSON files uploaded to S3 with this structure:
+The pipeline expects JSON files uploaded to S3 matching this schema:
 
 ```json
 {
-  "recordId": "string (unique identifier)",
-  "userEmail": "string (valid email)",
+  "recordId": "string — unique identifier, used as primary key",
+  "userEmail": "string — valid email address",
   "value": 123
 }
 ```
+
+All three fields are required. `value` must be numeric (integer).
 
 ---
 
 ## 🏠 Infrastructure as Code
 
-### Terraform Resources
+### Terraform Providers
 
-#### LocalStack (via AWS Provider)
+| Provider | Source | Purpose |
+|----------|--------|---------|
+| `aws` ~> 4.0 | hashicorp/aws | S3, SQS, DynamoDB via LocalStack |
+| `google` ~> 4.0 | hashicorp/google | Pub/Sub, Cloud SQL, Cloud Functions |
+| `archive` ~> 2.0 | hashicorp/archive | Zip Cloud Function source code |
+| `random` ~> 3.0 | hashicorp/random | Globally unique GCS bucket names |
 
-| Resource | Name | Description |
-|----------|------|-------------|
-| `aws_s3_bucket` | `hybrid-cloud-bucket` | Data ingestion bucket |
-| `aws_sqs_queue` | `data-processing-queue` | Processing queue |
-| `aws_sqs_queue` | `data-processing-queue-dlq` | Dead-letter queue |
-| `aws_s3_bucket_notification` | — | S3→SQS event trigger |
-| `aws_dynamodb_table` | `processed-records` | Write-back storage |
+### LocalStack Resources (via AWS Provider)
 
-#### Google Cloud Platform
+| Resource | Name | Key Configuration |
+|----------|------|-------------------|
+| `aws_s3_bucket` | `hybrid-cloud-bucket` | `force_destroy = true` |
+| `aws_sqs_queue` | `data-processing-queue` | Long poll 20s, visibility 60s, redrive to DLQ |
+| `aws_sqs_queue` | `data-processing-queue-dlq` | 14-day retention for failed messages |
+| `aws_s3_bucket_notification` | — | Filters `*.json`, sends to SQS |
+| `aws_sqs_queue_policy` | — | Allows S3 to send messages |
+| `aws_dynamodb_table` | `processed-records` | Hash key: `recordId` (String) |
 
-| Resource | Name | Description |
-|----------|------|-------------|
-| `google_pubsub_topic` | `localstack-events` | Bridge target topic |
-| `google_pubsub_topic` | `localstack-events-dlq` | Dead-letter topic |
-| `google_sql_database_instance` | `hybrid-pipeline-db` | PostgreSQL 14 instance |
+### GCP Resources
+
+| Resource | Name | Key Configuration |
+|----------|------|-------------------|
+| `google_pubsub_topic` | `localstack-events` | 24h message retention |
+| `google_pubsub_topic` | `localstack-events-dlq` | Dead-letter for failed messages |
+| `google_pubsub_subscription` | `localstack-events-subscription` | 5 max delivery attempts, retry backoff 10s→600s |
+| `google_sql_database_instance` | `hybrid-pipeline-db` | PostgreSQL 14, f1-micro, backup enabled |
 | `google_sql_database` | `pipelinedb` | Application database |
-| `google_cloudfunctions_function` | `pipeline-processor` | Event processor |
+| `google_sql_user` | `pipeline_user` | Password from `cloud_sql_password` variable |
+| `google_cloudfunctions_function` | `pipeline-processor` | Python 3.11, 256MB, 120s timeout, max 10 instances |
+| `google_storage_bucket` | `{project}-fn-src-{hash}` | Versioned, globally unique name |
 
 ---
 
@@ -367,27 +396,40 @@ The pipeline expects JSON files uploaded to S3 with this structure:
 
 The bridge is the critical link between AWS (LocalStack) and GCP. It runs as a Docker container alongside LocalStack.
 
-**Key Features:**
-- **Long Polling**: Uses SQS long polling (20s) to minimize API calls
-- **Exponential Backoff**: Retries failed Pub/Sub publishes with exponential backoff (up to 5 retries)
-- **Graceful Shutdown**: Handles SIGTERM/SIGINT for clean container stops
-- **S3 Content Download**: Extracts the actual file content (not just the S3 event metadata) before forwarding
-- **Structured Logging**: Timestamps, log levels, and contextual information
+**Production Features:**
+| Feature | Implementation |
+|---------|----------------|
+| Long Polling | SQS `WaitTimeSeconds=20` reduces API calls to ~3/minute when idle |
+| Exponential Backoff | 1s → 2s → 4s → 8s → 16s retries for Pub/Sub failures (5 max) |
+| Graceful Shutdown | Handles `SIGTERM`/`SIGINT`, completes in-flight message before exit |
+| Content Download | Downloads actual S3 file (not just event metadata) before forwarding |
+| JSON Validation | Validates S3 content is valid JSON before publishing to Pub/Sub |
+| URL Decoding | Properly handles URL-encoded S3 keys (`%20`, `+`, etc.) |
+| Health Metrics | Logs `received/forwarded/failed/errors` counts every 60 seconds |
+| Security | Runs as non-root `appuser` in Docker, GCP key mounted read-only |
 
 ### GCP Cloud Function (`src/processor_function/`)
 
 Serverless function triggered by Pub/Sub messages.
 
-**Key Features:**
-- **Idempotent Processing**: Uses `INSERT ... ON CONFLICT DO UPDATE` for Cloud SQL and `put_item` (overwrite) for DynamoDB
-- **Dual Write**: Stores processed data in both Cloud SQL and DynamoDB
-- **Auto-provisioning**: Creates the `records` table if it doesn't exist
-- **Validation**: Checks for required fields before processing
-- **Configurable Endpoints**: DynamoDB endpoint is configurable via environment variable
+**Production Features:**
+| Feature | Implementation |
+|---------|----------------|
+| Idempotent SQL | `INSERT ... ON CONFLICT (id) DO UPDATE` — safe for duplicate triggers |
+| Idempotent DynamoDB | `put_item` overwrites existing items by primary key |
+| Connection Pooling | Module-level cached connections survive across warm invocations |
+| Stale Detection | Tests cached SQL connection with `SELECT 1` before use |
+| Field Validation | Checks required fields exist AND validates types (string, numeric) |
+| Named Parameters | Uses `pg8000.native` with `:name` parameters for safety |
+| Auto-DDL | Creates `records` table on first invocation, skips on subsequent |
+| Concurrency Limit | `max_instances = 10` prevents connection exhaustion |
 
 ### LocalStack Init Script (`localstack_init/`)
 
-Shell script that automatically creates AWS resources when LocalStack starts. This ensures resources exist immediately, even before Terraform is applied.
+Shell script that auto-creates AWS resources when LocalStack reaches ready state:
+- Idempotent: uses `|| echo "already exists"` pattern
+- Creates S3 bucket → SQS DLQ → SQS queue (with redrive) → DynamoDB table → S3 notification
+- Runs before Terraform, so the bridge can poll immediately
 
 ---
 
@@ -398,59 +440,62 @@ Shell script that automatically creates AWS resources when LocalStack starts. Th
 ```bash
 # 1. Ensure everything is running
 docker-compose up --build -d
-docker-compose ps  # Verify healthy status
+docker-compose ps  # Wait for "healthy" status
 
 # 2. Upload test data
 awslocal s3 cp test-event.json s3://hybrid-cloud-bucket/
 
-# 3. Verify SQS received the notification
+# 3. Verify SQS received the S3 event notification
 awslocal sqs receive-message \
-    --queue-url http://localhost:4566/000000000000/data-processing-queue \
+    --queue-url $(awslocal sqs get-queue-url --queue-name data-processing-queue --output text --query 'QueueUrl') \
     --wait-time-seconds 10
 
-# 4. Check bridge logs
-docker logs bridge_app -f
+# 4. Watch bridge logs for forwarding confirmation
+docker logs bridge_app --tail 50
 
-# 5. Verify GCP processing (after ~60 seconds)
-# Check Cloud SQL
-gcloud sql connect hybrid-pipeline-db --user=pipeline_user --database=pipelinedb
-# SQL> SELECT * FROM records WHERE id = 'xyz-789';
-
-# 6. Verify DynamoDB write-back
+# 5. Wait ~60 seconds, then verify DynamoDB write-back
 awslocal dynamodb get-item \
     --table-name processed-records \
     --key '{"recordId":{"S":"xyz-789"}}'
 
-# Expected output:
+# Expected DynamoDB output:
 # {
 #   "Item": {
 #     "recordId": {"S": "xyz-789"},
 #     "userEmail": {"S": "test@example.com"},
 #     "value": {"N": "120"},
-#     "processedAt": {"S": "2024-01-15T10:30:00+00:00"}
+#     "processedAt": {"S": "2026-04-11T10:30:00+00:00"}
 #   }
 # }
+
+# 6. Verify Cloud SQL (after GCP infrastructure is deployed)
+gcloud sql connect hybrid-pipeline-db --user=pipeline_user --database=pipelinedb
+# SQL> SELECT * FROM records WHERE id = 'xyz-789';
+# Expected: id='xyz-789', user_email='test@example.com', value=120, processed_at=<timestamp>
 ```
 
-### Verify Specific Components
+### Component Verification
 
 ```bash
-# Check LocalStack health
-curl http://localhost:4566/_localstack/health
+# LocalStack health
+curl -sf http://localhost:4566/_localstack/health | python -m json.tool
 
-# List S3 buckets
-awslocal s3api list-buckets
+# S3 bucket notification configuration
+awslocal s3api get-bucket-notification-configuration --bucket hybrid-cloud-bucket
 
-# Describe SQS queue
+# SQS queue attributes (verify DLQ, visibility, polling)
 awslocal sqs get-queue-attributes \
-    --queue-url http://localhost:4566/000000000000/data-processing-queue \
+    --queue-url $(awslocal sqs get-queue-url --queue-name data-processing-queue --output text --query 'QueueUrl') \
     --attribute-names All
 
-# Describe DynamoDB table
+# DynamoDB table description
 awslocal dynamodb describe-table --table-name processed-records
 
-# Check GCP Cloud Function logs
-gcloud functions logs read pipeline-processor --region=us-central1
+# GCP Cloud Function logs
+gcloud functions logs read pipeline-processor --region=us-central1 --limit=20
+
+# Bridge health metrics
+docker logs bridge_app 2>&1 | grep "\[HEALTH\]"
 ```
 
 ---
@@ -459,40 +504,45 @@ gcloud functions logs read pipeline-processor --region=us-central1
 
 ### LocalStack Issues
 
-| Issue | Solution |
-|-------|----------|
-| Container not starting | Ensure Docker is running and ports 4566, 4510-4559 are free |
-| Health check failing | Wait 30-60 seconds for services to initialize |
-| Resources missing | Check `docker logs localstack_main` for init script errors |
-| S3 notification not working | Re-run `localstack_init/setup-s3-notifications.sh` manually |
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| Container won't start | Port 4566 in use | `lsof -i :4566` and kill conflicting process |
+| Health check stays "starting" | Services initializing | Wait 30-60s, check `docker logs localstack_main` |
+| Resources missing after restart | Persistence not working | Verify `localstack_data/` volume mount exists |
+| S3 notifications not firing | Notification config lost | `docker exec localstack_main bash /etc/localstack/init/ready.d/setup-s3-notifications.sh` |
 
 ### Bridge Application Issues
 
-| Issue | Solution |
-|-------|----------|
-| Can't connect to SQS | Verify LocalStack is healthy and endpoint URL is correct |
-| GCP auth errors | Check `GOOGLE_APPLICATION_CREDENTIALS` and key file mount |
-| No messages received | Verify S3→SQS notification config with `awslocal s3api get-bucket-notification-configuration --bucket hybrid-cloud-bucket` |
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| Bridge exits immediately | `GCP_PROJECT_ID` not set | Set it in `.env` |
+| "Connection refused" to SQS | LocalStack not healthy | Check `docker-compose ps` health status |
+| GCP authentication errors | Key file not mounted | Verify `PATH_TO_GCP_KEYFILE` points to valid JSON |
+| No messages forwarded | S3 notification not configured | Check `awslocal s3api get-bucket-notification-configuration --bucket hybrid-cloud-bucket` |
 
 ### Terraform Issues
 
-| Issue | Solution |
-|-------|----------|
-| `terraform init` fails | Check internet connectivity and provider versions |
-| LocalStack resources fail | Ensure LocalStack is running before `terraform apply` |
-| GCP resources fail | Verify credentials, project ID, and enabled APIs |
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| `terraform init` fails | Missing providers | Check internet connectivity |
+| LocalStack resources timeout | LocalStack not running | Start LocalStack before `terraform apply` |
+| Cloud SQL takes forever | Normal behavior | Cloud SQL provisioning takes 5-10 minutes |
+| GCS bucket name conflict | Globally non-unique | The `random_id` suffix should prevent this |
 
 ---
 
 ## 🔒 Security Considerations
 
-1. **Credentials Management**: All secrets are loaded from environment variables (`.env` file), never hardcoded
-2. **`.env` in `.gitignore`**: Prevents accidental credential commits
-3. **Least Privilege**: GCP service account should have only required roles
-4. **Non-root Container**: Bridge runs as a non-root user (`appuser`)
-5. **Read-only Key Mount**: GCP key file is mounted read-only in the bridge container
-6. **Network Isolation**: Docker services communicate via internal bridge network
-7. **DLQ for Resilience**: Failed messages are captured in dead-letter queues for inspection
+| Concern | Mitigation |
+|---------|------------|
+| **Credential Storage** | All secrets via `.env` file (gitignored). Never hardcoded in source. |
+| **GCP Key File** | Mounted read-only (`:ro`) in Docker. Pattern-excluded in `.gitignore`. |
+| **Non-root Container** | Bridge runs as `appuser` (UID 1000), not root. |
+| **Docker Network** | Services communicate via internal `pipeline-network`, not host network. |
+| **Cloud SQL Access** | `0.0.0.0/0` allowed for evaluation. **In production**: use VPC connector + private IP. |
+| **Cloud SQL Password** | Passed as Terraform sensitive variable. In production: use Secret Manager. |
+| **Dead-Letter Queues** | Both SQS and Pub/Sub capture failed messages — prevents silent data loss. |
+| **Log Rotation** | Bridge container uses `json-file` driver with 10MB max, 3 file rotation. |
 
 ---
 
@@ -500,26 +550,32 @@ gcloud functions logs read pipeline-processor --region=us-central1
 
 | Decision | Rationale |
 |----------|-----------|
-| **Python** over Node.js | Superior AWS/GCP SDK support, simpler async patterns for polling |
-| **pg8000** over psycopg2 | Pure Python (no C dependencies), works in Cloud Functions without compilation |
-| **LocalStack init script** | Belt-and-suspenders approach: resources exist even before Terraform |
-| **Long polling** (20s) | Reduces API calls while maintaining low latency for new messages |
-| **Idempotent writes** | ON CONFLICT upsert + DynamoDB put_item prevent duplicates |
-| **DLQ on both sides** | Captures poison-pill messages without blocking the pipeline |
+| **Python 3.11** | Best-in-class AWS/GCP SDK support, simpler than async Node.js for polling |
+| **pg8000.native** | Pure Python (no C dependencies), reliable in Cloud Functions, named params |
+| **Module-level connection cache** | Avoids connection setup latency on warm Cloud Function invocations |
+| **LocalStack init script + Terraform** | Belt-and-suspenders: resources exist immediately for bridge, Terraform provides declarative IaC |
+| **SQS long polling (20s)** | Max wait reduces API calls to ~3/min idle while maintaining low latency |
+| **Idempotent writes everywhere** | `ON CONFLICT` upsert + DynamoDB `put_item` overwrite — safe for at-least-once delivery |
+| **DLQ on both sides** | SQS DLQ (3 retries) + Pub/Sub DLQ (5 attempts) — captures poison pills |
+| **`random_id` for GCS bucket** | GCS names are globally unique — avoids collision across projects |
+| **`s3_use_path_style = true`** | Required for LocalStack — virtual-hosted style fails against local endpoint |
+| **Health metrics logging** | Bridge logs `received/forwarded/failed/errors` every 60s for observability |
 
 ---
 
 ## 🧹 Cleanup
 
 ```bash
-# Stop containers
+# Stop and remove containers + volumes
 docker-compose down -v
 
-# Destroy GCP resources (to stop billing)
+# Destroy ALL GCP resources (stops billing immediately)
 cd terraform
-terraform destroy
+terraform destroy -auto-approve
 
-# Remove local data
-rm -rf localstack_data/
+# Remove local persistent data
+rm -rf localstack_data/ dist/
 ```
+
+> ⚠️ **Important**: Run `terraform destroy` to avoid ongoing Cloud SQL charges (~$7-10/day for `db-f1-micro`).
 

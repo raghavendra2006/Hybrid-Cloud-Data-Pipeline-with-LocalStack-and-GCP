@@ -2,8 +2,12 @@
 .env
 *.env.local
 
-# GCP Service Account Keys
-*.json
+# GCP Service Account Keys — never commit these
+gcp-*.json
+*-keyfile.json
+*-credentials.json
+
+# Whitelisted JSON files (not keys)
 !submission.json
 !test-event.json
 !package.json
@@ -17,16 +21,18 @@ localstack_data/
 .terraform.lock.hcl
 terraform.tfstate
 terraform.tfstate.backup
+terraform.tfvars
 *.tfplan
 crash.log
+
+# Build artifacts
+dist/
 
 # Python
 __pycache__/
 *.py[cod]
 *$py.class
 *.egg-info/
-dist/
-build/
 venv/
 .venv/
 
