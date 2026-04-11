@@ -1,0 +1,18 @@
+# ============================================
+# Terraform Variable Values (Example)
+# ============================================
+# Copy this file to terraform.tfvars and fill in your values:
+#   cp terraform.tfvars.example terraform.tfvars
+# ============================================
+
+gcp_project_id  = "your-gcp-project-id"
+gcp_region      = "us-central1"
+gcp_keyfile_path = "../gcp-service-account-key.json"
+
+cloud_sql_password = "your-secure-password"
+cloud_sql_tier     = "db-f1-micro"
+
+# Set this to the public URL of your LocalStack instance
+# if you want the GCP Cloud Function to write back to DynamoDB.
+# For local development, use a tunnel (e.g., ngrok).
+dynamodb_endpoint_for_function = "http://localhost:4566"
