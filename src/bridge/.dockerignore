@@ -1,0 +1,16 @@
+# Ignore everything not needed for the bridge image
+.git
+.gitignore
+__pycache__
+*.pyc
+*.pyo
+*.egg-info
+dist
+build
+.env
+.env.*
+*.md
+Makefile
+.vscode
+.idea
+tests
