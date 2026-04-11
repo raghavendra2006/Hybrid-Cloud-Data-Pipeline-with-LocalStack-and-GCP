@@ -1,0 +1,1 @@
+# Hybrid-Cloud-Data-Pipeline-with-LocalStack-and-GCP
