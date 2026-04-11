@@ -523,8 +523,3 @@ terraform destroy
 rm -rf localstack_data/
 ```
 
----
-
-## 📄 License
-
-This project is for educational purposes. See individual service terms for AWS, GCP, and LocalStack.
