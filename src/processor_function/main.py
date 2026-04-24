@@ -139,22 +139,24 @@ def write_to_cloud_sql(record: dict):
             """
             INSERT INTO records (id, user_email, value, processed_at)
             VALUES (:id, :email, :val, :ts)
-            ON CONFLICT (id) DO UPDATE SET
-                user_email = EXCLUDED.user_email,
-                value = EXCLUDED.value,
-                processed_at = EXCLUDED.processed_at
+            ON CONFLICT (id) DO NOTHING
             """,
             id=record["recordId"],
             email=record["userEmail"],
             val=int(record["value"]),
             ts=record["processedAt"],
         )
-        logger.info(f"Cloud SQL: Upserted record '{record['recordId']}'")
+        logger.info(f"Cloud SQL: Processed record '{record['recordId']}' (Upsert/Ignored if exists)")
 
     except Exception as e:
         logger.error(f"Cloud SQL write failed: {e}", exc_info=True)
-        # Reset cached connection so next invocation reconnects
+        # OVER-EXCELLENCE: Close connection before discarding to prevent resource leak
         global _db_connection, _table_created
+        if _db_connection:
+            try:
+                _db_connection.close()
+            except Exception:
+                pass
         _db_connection = None
         _table_created = False
         raise

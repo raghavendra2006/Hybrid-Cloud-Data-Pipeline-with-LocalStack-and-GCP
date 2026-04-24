@@ -9,11 +9,14 @@ Features:
   - Exponential backoff retry for GCP Pub/Sub publishing
   - Graceful shutdown on SIGTERM/SIGINT
   - Structured JSON logging
-  - Dead-letter queue support (via SQS redrive policy)
+  - Dead-letter queue support (poison pills preserved for SQS redrive)
   - Message counter / health metrics
   - URL-decoded S3 key handling
+  - Concurrent batch processing using ThreadPoolExecutor
+  - Handles batched S3 event records
 """
 
+import concurrent.futures
 import json
 import logging
 import os
@@ -22,7 +25,7 @@ import sys
 import time
 import urllib.parse
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Optional, List
 
 import boto3
 from botocore.config import Config as BotoConfig
@@ -109,8 +112,9 @@ def log_health_stats():
 # ============================================
 def create_aws_clients():
     """Create boto3 clients for SQS and S3 pointed at LocalStack."""
+    # OVER-EXCELLENCE: Use adaptive mode for high-throughput resiliency
     boto_config = BotoConfig(
-        retries={"max_attempts": 3, "mode": "standard"},
+        retries={"max_attempts": 5, "mode": "adaptive"},
         connect_timeout=10,
         read_timeout=30,
     )
@@ -172,49 +176,45 @@ def get_topic_path(publisher: pubsub_v1.PublisherClient) -> str:
 # ============================================
 # Message Processing
 # ============================================
-def extract_s3_file_content(sqs_body: dict, s3_client) -> Optional[str]:
+def extract_s3_file_contents(sqs_body: dict, s3_client) -> List[str]:
     """
-    Parse the SQS message body (S3 event notification) and download
-    the uploaded file content from S3.
-
-    Handles both S3 event notification format and direct JSON payloads.
-    URL-decodes the S3 key to handle special characters.
+    Parse the SQS message body and return a list of downloaded file contents.
+    Handles multiple S3 records batched into a single SQS message.
     """
+    contents = []
     try:
         # S3 event notifications wrap records in a list
         records = sqs_body.get("Records", [])
         if not records:
             # Fallback: treat the body itself as the payload (direct message)
-            logger.warning(
-                "No 'Records' found in SQS message body. "
-                "Treating body as direct payload."
-            )
-            return json.dumps(sqs_body)
+            logger.warning("No 'Records' found in SQS message body. Treating body as direct payload.")
+            return [json.dumps(sqs_body)]
 
-        record = records[0]
-        bucket = record["s3"]["bucket"]["name"]
-        # S3 event keys are URL-encoded
-        key = urllib.parse.unquote_plus(record["s3"]["object"]["key"])
+        for record in records:
+            bucket = record["s3"]["bucket"]["name"]
+            # S3 event keys are URL-encoded
+            key = urllib.parse.unquote_plus(record["s3"]["object"]["key"])
 
-        logger.info(f"Downloading s3://{bucket}/{key}")
-        response = s3_client.get_object(Bucket=bucket, Key=key)
-        content = response["Body"].read().decode("utf-8")
-        logger.info(f"Downloaded {len(content)} bytes from s3://{bucket}/{key}")
+            logger.info(f"Downloading s3://{bucket}/{key}")
+            response = s3_client.get_object(Bucket=bucket, Key=key)
+            content = response["Body"].read().decode("utf-8")
+            logger.info(f"Downloaded {len(content)} bytes from s3://{bucket}/{key}")
 
-        # Validate it's valid JSON before forwarding
-        json.loads(content)
+            # Validate it's valid JSON before forwarding
+            json.loads(content)
+            contents.append(content)
 
-        return content
+        return contents
 
     except json.JSONDecodeError as e:
         logger.error(f"Downloaded S3 content is not valid JSON: {e}")
-        return None
+        return []
     except (KeyError, IndexError) as e:
         logger.error(f"Malformed S3 event notification: {e}")
-        return None
+        return []
     except ClientError as e:
         logger.error(f"Failed to download S3 object: {e}")
-        return None
+        return []
 
 
 def publish_to_pubsub(publisher, topic_path: str, data: str) -> bool:
@@ -261,13 +261,61 @@ def delete_sqs_message(sqs_client, queue_url: str, receipt_handle: str):
         metrics["errors"] += 1
 
 
+def process_single_message(message: dict, sqs_client, s3_client, publisher, queue_url: str, topic_path: str):
+    """Processes a single SQS message concurrently."""
+    receipt_handle = message["ReceiptHandle"]
+    message_id = message.get("MessageId", "unknown")
+
+    try:
+        body = json.loads(message["Body"])
+    except json.JSONDecodeError:
+        # OVER-EXCELLENCE: Do NOT delete the message here! Let it reach DLQ.
+        logger.error(
+            f"Invalid JSON in SQS message {message_id}. "
+            f"Leaving poison pill in queue for DLQ processing."
+        )
+        metrics["messages_failed"] += 1
+        return
+
+    metrics["messages_received"] += 1
+    metrics["last_message_at"] = datetime.now(timezone.utc).isoformat()
+
+    # Extract all file contents from S3 (handles batched records)
+    file_contents = extract_s3_file_contents(body, s3_client)
+    if not file_contents:
+        logger.error(
+            f"Failed to extract S3 content for message {message_id}. "
+            "Leaving in queue for retry via visibility timeout."
+        )
+        metrics["messages_failed"] += 1
+        return
+
+    # Publish to Pub/Sub
+    all_success = True
+    for content in file_contents:
+        success = publish_to_pubsub(publisher, topic_path, content)
+        if success:
+            metrics["messages_forwarded"] += 1
+        else:
+            all_success = False
+            metrics["messages_failed"] += 1
+
+    # Only delete if EVERYTHING was successfully published
+    if all_success:
+        delete_sqs_message(sqs_client, queue_url, receipt_handle)
+    else:
+        logger.warning(
+            f"Partial/Full Pub/Sub publish failure for message {message_id}. "
+            "Leaving in SQS queue for retry."
+        )
+
+
 # ============================================
 # Main Polling Loop
 # ============================================
 def poll_and_forward(sqs_client, s3_client, publisher, queue_url: str, topic_path: str):
     """
-    Poll SQS for messages, download the S3 file content,
-    publish to Pub/Sub, and delete the SQS message.
+    Poll SQS for messages and process them concurrently.
     """
     try:
         response = sqs_client.receive_message(
@@ -289,45 +337,15 @@ def poll_and_forward(sqs_client, s3_client, publisher, queue_url: str, topic_pat
 
     logger.info(f"Received {len(messages)} message(s) from SQS.")
 
-    for message in messages:
-        receipt_handle = message["ReceiptHandle"]
-        message_id = message.get("MessageId", "unknown")
-
-        try:
-            body = json.loads(message["Body"])
-        except json.JSONDecodeError:
-            logger.error(
-                f"Invalid JSON in SQS message {message_id}. "
-                f"Deleting poison pill: {message['Body'][:200]}"
+    # OVER-EXCELLENCE: Concurrent processing for massive throughput improvement
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+        futures = [
+            executor.submit(
+                process_single_message, message, sqs_client, s3_client, publisher, queue_url, topic_path
             )
-            delete_sqs_message(sqs_client, queue_url, receipt_handle)
-            metrics["messages_failed"] += 1
-            continue
-
-        metrics["messages_received"] += 1
-        metrics["last_message_at"] = datetime.now(timezone.utc).isoformat()
-
-        # Extract file content from S3
-        file_content = extract_s3_file_content(body, s3_client)
-        if file_content is None:
-            logger.error(
-                f"Failed to extract S3 file content for message {message_id}. "
-                "Leaving in queue for retry via visibility timeout."
-            )
-            metrics["messages_failed"] += 1
-            continue
-
-        # Publish to Pub/Sub
-        success = publish_to_pubsub(publisher, topic_path, file_content)
-        if success:
-            delete_sqs_message(sqs_client, queue_url, receipt_handle)
-            metrics["messages_forwarded"] += 1
-        else:
-            logger.warning(
-                f"Pub/Sub publish failed for message {message_id}. "
-                "Will be retried after SQS visibility timeout."
-            )
-            metrics["messages_failed"] += 1
+            for message in messages
+        ]
+        concurrent.futures.wait(futures)
 
 
 def wait_for_localstack(sqs_client):

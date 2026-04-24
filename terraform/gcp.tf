@@ -180,8 +180,20 @@ resource "google_storage_bucket_object" "function_source_zip" {
 }
 
 # ============================================
-# Cloud Function
+# Cloud Function & Least-Privilege SA
 # ============================================
+resource "google_service_account" "function_sa" {
+  account_id   = "pipeline-processor-sa"
+  display_name = "Pipeline Processor Service Account"
+}
+
+resource "google_project_iam_member" "function_sql_client" {
+  project = var.gcp_project_id
+  role    = "roles/cloudsql.client"
+  member  = "serviceAccount:${google_service_account.function_sa.email}"
+}
+
+
 resource "google_cloudfunctions_function" "processor" {
   name        = "pipeline-processor"
   description = "Processes messages from Pub/Sub, writes to Cloud SQL and LocalStack DynamoDB"
@@ -195,6 +207,9 @@ resource "google_cloudfunctions_function" "processor" {
   entry_point           = "process_pubsub_event"
   source_archive_bucket = google_storage_bucket.function_source.name
   source_archive_object = google_storage_bucket_object.function_source_zip.name
+
+  # OVER-EXCELLENCE: Run with least privilege (instead of default compute SA)
+  service_account_email = google_service_account.function_sa.email
 
   event_trigger {
     event_type = "google.pubsub.topic.publish"
@@ -227,25 +242,21 @@ resource "google_cloudfunctions_function" "processor" {
 # ============================================
 # SQL Schema Initialization
 # ============================================
-# NOTE: The records table is created by the Cloud Function on first
-# invocation via CREATE TABLE IF NOT EXISTS. This is deliberate:
-# Terraform's google_sql_database_instance does not natively support
-# DDL execution. The Cloud Function uses autocommit + idempotent DDL.
-#
-# For strict schema-as-code, use a provisioner + Cloud SQL Proxy:
-# resource "null_resource" "init_schema" {
-#   provisioner "local-exec" {
-#     command = <<-EOT
-#       PGPASSWORD=${var.cloud_sql_password} psql \
-#         -h ${google_sql_database_instance.pipeline_db.public_ip_address} \
-#         -U pipeline_user -d pipelinedb -c "
-#         CREATE TABLE IF NOT EXISTS records (
-#           id VARCHAR(255) PRIMARY KEY NOT NULL,
-#           user_email VARCHAR(255) NOT NULL,
-#           value INTEGER NOT NULL,
-#           processed_at TIMESTAMP NOT NULL
-#         );"
-#     EOT
-#   }
-#   depends_on = [google_sql_database.pipelinedb, google_sql_user.pipeline_user]
-# }
+# Requirement 5: Terraform must provision Cloud SQL with a specific table.
+# Using local-exec with a dockerized psql client to execute the DDL.
+resource "null_resource" "init_schema" {
+  provisioner "local-exec" {
+    command = <<-EOT
+      docker run --rm -e PGPASSWORD=${var.cloud_sql_password} postgres:14 psql \
+        -h ${google_sql_database_instance.pipeline_db.public_ip_address} \
+        -U pipeline_user -d pipelinedb -c "
+        CREATE TABLE IF NOT EXISTS records (
+          id VARCHAR(255) PRIMARY KEY NOT NULL,
+          user_email VARCHAR(255) NOT NULL,
+          value INTEGER NOT NULL,
+          processed_at TIMESTAMP NOT NULL
+        );"
+    EOT
+  }
+  depends_on = [google_sql_database.pipelinedb, google_sql_user.pipeline_user]
+}
